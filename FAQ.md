@@ -528,11 +528,12 @@ A: Guidelines:
 
 A: Depends on configuration:
 
-- `ENABLE_AUTONOMOUS_TRADING=true`: Yes, within safety limits
+- `ENABLE_AUTONOMOUS_TRADING=false` (default): Always asks before trading
+- `ENABLE_AUTONOMOUS_TRADING=true`: Allows trading without confirmation
 - `REQUIRE_CONFIRMATION_ABOVE_USD=X`: Asks for orders over $X
-- `ENABLE_AUTONOMOUS_TRADING=false`: Always asks before trading
 
-For beginners: Set `REQUIRE_CONFIRMATION_ABOVE_USD=100` to review all significant trades.
+For beginners: Keep the default and set `REQUIRE_CONFIRMATION_ABOVE_USD=100` to review all
+significant trades.
 
 ---
 
