@@ -81,6 +81,8 @@ Create a `.env` file in the project root:
 # Required: Polygon wallet credentials
 POLYGON_PRIVATE_KEY=0x1234...  # Your wallet private key
 POLYGON_ADDRESS=0xABCD...      # Your wallet address
+POLYMARKET_SIGNER_ADDRESS=     # Optional explicit signer; must match POLYGON_PRIVATE_KEY
+POLYMARKET_FUNDER_ADDRESS=     # Deposit/funder wallet, distinct from the Rabby signer
 
 # Optional: CLOB/relayer login credentials (preferred names)
 POLYMARKET_RELAYER_KEY=         # Leave empty to auto-generate
@@ -102,8 +104,14 @@ POLYMARKET_CHAIN_ID=137        # Polygon mainnet (137) or Amoy testnet (80002)
 # Safety limits
 MAX_ORDER_SIZE_USD=1000
 MAX_TOTAL_EXPOSURE_USD=10000
+ENABLE_AUTONOMOUS_TRADING=false
 REQUIRE_CONFIRMATION_ABOVE_USD=100
 ```
+
+`POLYGON_PRIVATE_KEY` remains the signer key. For a Polymarket Deposit Wallet,
+configure its address with `POLYMARKET_FUNDER_ADDRESS`; the legacy
+`POLYMARKET_FUNDER` variable is still accepted. Autonomous trading is disabled
+unless explicitly enabled.
 
 ### Getting Your Credentials
 
@@ -153,13 +161,13 @@ Use this exact checklist:
 - If signer and UI wallet are the same, you may leave empty (it falls back to `POLYGON_ADDRESS`).
 - Example:
   ```env
-  POLYMARKET_FUNDER=0xYourPolymarketDepositWallet
+  POLYMARKET_FUNDER_ADDRESS=0xYourPolymarketDepositWallet
   ```
 
 #### 4) `POLYMARKET_SIGNATURE_TYPE` (auth mode)
 - This server supports:
   - `0` for EOA direct mode (funder must be the signer EOA)
-  - `2` for proxy wallet (`POLY_PROXY`) setups
+  - `2` for legacy Gnosis Safe/contract-wallet setups
   - `3` for MetaMask + deposit-wallet (`POLY_1271`) setups
 - Example:
   ```env
@@ -188,8 +196,8 @@ Use this exact checklist:
 ```env
 DEMO_MODE=false
 POLYGON_PRIVATE_KEY=<metamask_private_key>
-POLYGON_ADDRESS=<metamask_eoa_address>
-POLYMARKET_FUNDER=<polymarket_deposit_wallet_address>
+POLYMARKET_SIGNER_ADDRESS=<metamask_eoa_address>
+POLYMARKET_FUNDER_ADDRESS=<polymarket_deposit_wallet_address>
 POLYMARKET_SIGNATURE_TYPE=3
 POLYMARKET_RELAYER_KEY=
 POLYMARKET_RELAYER_SECRET=

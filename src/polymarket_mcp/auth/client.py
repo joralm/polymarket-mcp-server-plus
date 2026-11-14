@@ -30,59 +30,15 @@ from ..utils.usdc import scale_usdc_atomic_units
 
 logger = logging.getLogger(__name__)
 
-_CRED_BANNER = "=" * 70
 DEFAULT_USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 DEFAULT_CTF_EXCHANGE_ADDRESS = "0x4bFb9717ad29EE08a240D9e6e8854045f9B0721c"
 MIN_ALLOWANCE_THRESHOLD = 1_000_000 * (10**6)
 MAX_UINT256 = 2**256 - 1
 
 
-def _log_new_credentials(api_key: str, api_secret: str, passphrase: str, reason: str) -> None:
-    """
-    Emit a visually prominent INFO block showing newly generated API credentials.
-
-    The banner is logged at INFO level so it is always visible regardless of the
-    configured log level, and it tells the operator exactly which docker-compose /
-    .env variables they need to update and restart the container.
-
-    Args:
-        api_key: The newly issued POLYMARKET_API_KEY value.
-        api_secret: The newly issued POLYMARKET_API_SECRET value.
-        passphrase: The newly issued POLYMARKET_PASSPHRASE value.
-        reason: Short description of why credentials were generated (shown in banner title).
-    """
-    logger.info(_CRED_BANNER)
-    logger.info("⚠️  NEW POLYMARKET API CREDENTIALS GENERATED  ⚠️")
-    logger.info("Reason: %s", reason)
-    logger.info(_CRED_BANNER)
-    logger.info("Copy the values below into your docker-compose.yml (or .env file):")
-    logger.info("")
-    # NOTE: Clear-text credential logging is intentional here.
-    # The sole purpose of this function is to display newly-derived API keys to the
-    # operator so they can persist them in their docker-compose / .env and avoid
-    # re-deriving a fresh key on every restart (Polymarket imposes per-wallet limits).
-    # Ensure your logging backend (log files, aggregators) has appropriate access controls.
-    logger.info(
-        "  POLYMARKET_RELAYER_KEY=%s", api_key
-    )  # codeql[py/clear-text-logging-sensitive-data]
-    logger.info(
-        "  POLYMARKET_RELAYER_SECRET=%s", api_secret
-    )  # codeql[py/clear-text-logging-sensitive-data]
-    logger.info(
-        "  POLYMARKET_RELAYER_PASSPHRASE=%s", passphrase
-    )  # codeql[py/clear-text-logging-sensitive-data]
-    logger.info("  # Legacy aliases (same values):")
-    logger.info("  POLYMARKET_API_KEY=%s", api_key)  # codeql[py/clear-text-logging-sensitive-data]
-    logger.info(
-        "  POLYMARKET_API_SECRET=%s", api_secret
-    )  # codeql[py/clear-text-logging-sensitive-data]
-    logger.info(
-        "  POLYMARKET_PASSPHRASE=%s", passphrase
-    )  # codeql[py/clear-text-logging-sensitive-data]
-    logger.info("")
-    logger.info("Then RESTART the container so the new credentials are picked up:")
-    logger.info("  docker compose down && docker compose up -d")
-    logger.info(_CRED_BANNER)
+def _log_new_credentials(reason: str) -> None:
+    """Report credential setup without logging any credential material."""
+    logger.info("CLOB API credentials initialized (%s); credential values were not logged.", reason)
 
 
 class PolymarketClient:
@@ -127,12 +83,10 @@ class PolymarketClient:
         requested_funder = (funder or address).lower()
         self.chain_id = chain_id
         if signature_type not in {0, 2, 3}:
-            logger.warning(
-                "Unsupported signature_type=%s requested; defaulting to 3 "
-                "(POLY_1271/deposit wallet).",
-                signature_type,
+            raise ValueError(
+                f"Unsupported Polymarket signature_type={signature_type}; refusing to "
+                "fall back to another wallet type."
             )
-            signature_type = 3
         self.signature_type = signature_type
         self._is_type3_signature = self.signature_type == 3
         if self.signature_type == 0 and requested_funder != self.address:
@@ -188,10 +142,14 @@ class PolymarketClient:
         self._initialize_client()
         if self.signature_type == 2 and self.client is not None:
             try:
-                logger.info("Smart Proxy mode (type 2) active. Verifying allowances on-chain...")
+                logger.info("Gnosis Safe mode (type 2) active. Verifying allowances on-chain...")
                 self.auto_approve_allowances()
             except Exception as e:
-                logger.error(f"Error while running startup auto-approve: {e}")
+                logger.error(
+                    "Error while running startup auto-approve (%s): %s",
+                    type(e).__name__,
+                    self._safe_error_text(e),
+                )
         elif self._is_type3_signature and self.client is not None:
             try:
                 logger.info(
@@ -205,9 +163,10 @@ class PolymarketClient:
                 )
             except Exception as e:
                 logger.warning(
-                    "Startup balance/allowance sync failed (non-fatal): %s. "
+                    "Startup balance/allowance sync failed (non-fatal, %s): %s. "
                     "Trading will proceed; Polymarket will re-sync on the first order.",
-                    e,
+                    type(e).__name__,
+                    self._safe_error_text(e),
                 )
 
         logger.info(
@@ -223,6 +182,30 @@ class PolymarketClient:
             self._api_credentials_verified,
             self._zero_balance_proxy_refresh_attempted,
         )
+
+    def _safe_error_text(self, error: Exception) -> str:
+        """Redact private and API credentials from third-party error messages."""
+        message = str(error)
+        secrets = [self.private_key, getattr(self, "_expected_api_key", None)]
+        credentials = getattr(self, "api_creds", None)
+        if credentials:
+            secrets.extend(
+                [
+                    getattr(credentials, "api_key", None),
+                    getattr(credentials, "api_secret", None),
+                    getattr(credentials, "api_passphrase", None),
+                ]
+            )
+        for secret in secrets:
+            if isinstance(secret, str) and secret:
+                candidates = [secret]
+                if secret == self.private_key:
+                    candidates.append(secret[2:] if secret.startswith("0x") else f"0x{secret}")
+                for candidate in candidates:
+                    message = re.sub(
+                        re.escape(candidate), "[REDACTED]", message, flags=re.IGNORECASE
+                    )
+        return message
 
     def _initialize_client(self) -> None:
         """Initialize the ClobClient with appropriate authentication"""
@@ -266,7 +249,11 @@ class PolymarketClient:
             )
 
         except Exception as e:
-            logger.error(f"Failed to initialize ClobClient: {e}")
+            logger.error(
+                "Failed to initialize ClobClient (%s): %s",
+                type(e).__name__,
+                self._safe_error_text(e),
+            )
             raise
 
     @staticmethod
@@ -488,7 +475,11 @@ class PolymarketClient:
             return True
 
         except Exception as e:
-            logger.error(f"Startup auto_approve_allowances failed: {str(e)}")
+            logger.error(
+                "Startup auto_approve_allowances failed (%s): %s",
+                type(e).__name__,
+                self._safe_error_text(e),
+            )
             return False
 
     def get_client(self) -> ClobClient:
@@ -542,15 +533,16 @@ class PolymarketClient:
             self._initialize_client()
 
             _log_new_credentials(
-                api_key=self.api_creds.api_key,
-                api_secret=self.api_creds.api_secret,
-                passphrase=self.api_creds.api_passphrase,
-                reason="No API credentials were configured — generated automatically on first run",
+                "No API credentials were configured; generated automatically on first run"
             )
             return self.api_creds
 
         except Exception as e:
-            logger.error(f"Failed to create API credentials: {e}")
+            logger.error(
+                "Failed to create API credentials (%s): %s",
+                type(e).__name__,
+                self._safe_error_text(e),
+            )
             raise
 
     async def get_markets(
@@ -572,7 +564,9 @@ class PolymarketClient:
             return markets
 
         except Exception as e:
-            logger.error(f"Failed to fetch markets: {e}")
+            logger.error(
+                "Failed to fetch markets (%s): %s", type(e).__name__, self._safe_error_text(e)
+            )
             raise
 
     async def get_market(self, condition_id: str) -> Dict[str, Any]:
@@ -590,7 +584,9 @@ class PolymarketClient:
             return market
 
         except Exception as e:
-            logger.error(f"Failed to fetch market {condition_id}: {e}")
+            logger.error(
+                "Failed to fetch market (%s): %s", type(e).__name__, self._safe_error_text(e)
+            )
             raise
 
     @staticmethod
@@ -653,7 +649,12 @@ class PolymarketClient:
             return normalized
 
         except Exception as e:
-            logger.error(f"Failed to fetch orderbook for {token_id}: {e}")
+            logger.error(
+                "Failed to fetch orderbook for %s (%s): %s",
+                token_id,
+                type(e).__name__,
+                self._safe_error_text(e),
+            )
             raise
 
     async def get_price(self, token_id: str, side: str) -> float:
@@ -672,7 +673,12 @@ class PolymarketClient:
             return float(price_data.get("price", 0))
 
         except Exception as e:
-            logger.error(f"Failed to fetch price for {token_id}: {e}")
+            logger.error(
+                "Failed to fetch price for %s (%s): %s",
+                token_id,
+                type(e).__name__,
+                self._safe_error_text(e),
+            )
             raise
 
     async def post_order(
@@ -771,10 +777,14 @@ class PolymarketClient:
                     order_response.get("orderID") if isinstance(order_response, dict) else None,
                 )
                 return order_response
-            logger.error(f"Failed to post order: {e}")
+            logger.error(
+                "Failed to post order (%s): %s", type(e).__name__, self._safe_error_text(e)
+            )
             raise
         except Exception as e:
-            logger.error(f"Failed to post order: {e}")
+            logger.error(
+                "Failed to post order (%s): %s", type(e).__name__, self._safe_error_text(e)
+            )
             raise
 
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
@@ -799,7 +809,12 @@ class PolymarketClient:
             return response
 
         except Exception as e:
-            logger.error(f"Failed to cancel order {order_id}: {e}")
+            logger.error(
+                "Failed to cancel order %s (%s): %s",
+                order_id,
+                type(e).__name__,
+                self._safe_error_text(e),
+            )
             raise
 
     async def cancel_all_orders(self) -> Dict[str, Any]:
@@ -821,7 +836,9 @@ class PolymarketClient:
             return response
 
         except Exception as e:
-            logger.error(f"Failed to cancel all orders: {e}")
+            logger.error(
+                "Failed to cancel all orders (%s): %s", type(e).__name__, self._safe_error_text(e)
+            )
             raise
 
     async def post_market_order(
@@ -898,10 +915,14 @@ class PolymarketClient:
                     order_response.get("orderID") if isinstance(order_response, dict) else None,
                 )
                 return order_response
-            logger.error("Failed to post market order: %s", e)
+            logger.error(
+                "Failed to post market order (%s): %s", type(e).__name__, self._safe_error_text(e)
+            )
             raise
         except Exception as e:
-            logger.error("Failed to post market order: %s", e)
+            logger.error(
+                "Failed to post market order (%s): %s", type(e).__name__, self._safe_error_text(e)
+            )
             raise
 
     async def get_order(self, order_id: str) -> Dict[str, Any]:
@@ -923,7 +944,12 @@ class PolymarketClient:
             order = self.client.get_order(order_id)
             return order
         except Exception as e:
-            logger.error("Failed to fetch order %s: %s", order_id, e)
+            logger.error(
+                "Failed to fetch order %s (%s): %s",
+                order_id,
+                type(e).__name__,
+                self._safe_error_text(e),
+            )
             raise
 
     async def get_trades(
@@ -951,7 +977,9 @@ class PolymarketClient:
             trades = self.client.get_trades(params)
             return trades if isinstance(trades, list) else []
         except Exception as e:
-            logger.error("Failed to fetch trades: %s", e)
+            logger.error(
+                "Failed to fetch trades (%s): %s", type(e).__name__, self._safe_error_text(e)
+            )
             raise
 
     async def cancel_market_orders_by_params(
@@ -1022,7 +1050,9 @@ class PolymarketClient:
             return orders
 
         except Exception as e:
-            logger.error(f"Failed to fetch orders: {e}")
+            logger.error(
+                "Failed to fetch orders (%s): %s", type(e).__name__, self._safe_error_text(e)
+            )
             raise
 
     async def get_positions(self) -> List[Dict[str, Any]]:
@@ -1058,7 +1088,9 @@ class PolymarketClient:
                 return data if isinstance(data, list) else []
 
         except Exception as e:
-            logger.error(f"Failed to fetch positions: {e}")
+            logger.error(
+                "Failed to fetch positions (%s): %s", type(e).__name__, self._safe_error_text(e)
+            )
             raise
 
     @staticmethod
@@ -1169,10 +1201,14 @@ class PolymarketClient:
                 )
                 self._refresh_api_credentials()
                 return self._fetch_balance_once()
-            logger.error(f"Failed to fetch balance: {e}")
+            logger.error(
+                "Failed to fetch balance (%s): %s", type(e).__name__, self._safe_error_text(e)
+            )
             raise
         except Exception as e:
-            logger.error(f"Failed to fetch balance: {e}")
+            logger.error(
+                "Failed to fetch balance (%s): %s", type(e).__name__, self._safe_error_text(e)
+            )
             raise
 
     def _fetch_balance_once(self) -> Dict[str, Any]:
@@ -1358,13 +1394,10 @@ class PolymarketClient:
             self._initialize_client()
 
         _log_new_credentials(
-            api_key=self.api_creds.api_key,
-            api_secret=self.api_creds.api_secret,
-            passphrase=self.api_creds.api_passphrase,
-            reason=(
+            (
                 "Configured API key belonged to a different wallet — replaced "
                 "with signer-derived credentials"
-            ),
+            )
         )
 
     async def ensure_valid_api_credentials(self) -> None:
@@ -1545,12 +1578,7 @@ class PolymarketClient:
             # wallets with zero USDC balance don't spam "NEW CREDENTIALS GENERATED"
             # on every container restart (the SDK deterministically re-derives the
             # same key, so nothing actually changed).
-            _log_new_credentials(
-                api_key=self.api_creds.api_key,
-                api_secret=self.api_creds.api_secret,
-                passphrase=self.api_creds.api_passphrase,
-                reason=reason,
-            )
+            _log_new_credentials(reason)
         else:
             logger.info(
                 "Credential re-derivation returned the same API key — "

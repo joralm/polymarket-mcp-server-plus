@@ -145,7 +145,7 @@ def _get_portfolio_funder_address(polymarket_client, config) -> str:
     effective_funder = getattr(config, "effective_funder", None)
     if effective_funder:
         return str(effective_funder).lower()
-    return str(config.POLYGON_ADDRESS).lower()
+    return str(getattr(config, "effective_signer_address", config.POLYGON_ADDRESS)).lower()
 
 
 def _is_permission_error(exc: Exception) -> bool:

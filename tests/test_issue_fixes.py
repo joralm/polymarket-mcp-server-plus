@@ -11,13 +11,18 @@ import json
 import os
 import logging
 import httpx
+from eth_account import Account
 from unittest.mock import AsyncMock, patch, MagicMock
 from datetime import datetime, timedelta
 
 from py_clob_client_v2.client import ClobClient
 from py_clob_client_v2.clob_types import ApiCreds, AssetType, OrderBookSummary, OrderSummary
 from py_clob_client_v2.exceptions import PolyApiException
-from polymarket_mcp.auth.client import MIN_ALLOWANCE_THRESHOLD, PolymarketClient
+from polymarket_mcp.auth.client import (
+    MIN_ALLOWANCE_THRESHOLD,
+    PolymarketClient,
+    _log_new_credentials,
+)
 from polymarket_mcp.config import PolymarketConfig, load_config
 from polymarket_mcp.tools.portfolio import get_portfolio_value, _extract_cash_balance
 from polymarket_mcp.tools.trading import TradingTools
@@ -70,6 +75,79 @@ class TestCredentialMasking:
                 assert (
                     "api_key)" not in stripped and "api_passphrase)" not in stripped
                 ), f"Line {i+1} logs full credential at INFO: {stripped}"
+
+    def test_generated_credentials_are_never_logged(self, caplog):
+        credentials = ("api-key-value", "api-secret-value", "api-passphrase-value")
+        with caplog.at_level(logging.INFO, logger="polymarket_mcp.auth.client"):
+            _log_new_credentials("generated for test")
+        assert all(value not in caplog.text for value in credentials)
+
+    @pytest.mark.asyncio
+    async def test_tool_error_does_not_echo_arguments(self):
+        import polymarket_mcp.server as server_module
+
+        secret = "private-api-token"
+        result = await server_module.call_tool("unknown_test_tool", {"api_key": secret})
+        payload = json.loads(result[0].text)
+        assert payload["arguments"]["api_key"] == "[REDACTED]"
+        assert secret not in result[0].text
+
+
+class TestWalletAndTradingDefaults:
+    def test_signer_and_funder_addresses_are_separate_and_validated(self):
+        private_key = "1" * 64
+        signer = Account.from_key(private_key).address
+        funder = "0x" + "2" * 40
+        config = PolymarketConfig(
+            _env_file=None,
+            POLYGON_PRIVATE_KEY=private_key,
+            POLYMARKET_SIGNER_ADDRESS=signer,
+            POLYMARKET_FUNDER_ADDRESS=funder,
+        )
+        assert config.effective_signer_address == signer
+        assert config.effective_funder == funder
+
+    def test_explicit_signer_must_match_private_key(self):
+        with pytest.raises(ValueError, match="does not match POLYGON_PRIVATE_KEY"):
+            PolymarketConfig(
+                _env_file=None,
+                POLYGON_PRIVATE_KEY="1" * 64,
+                POLYMARKET_SIGNER_ADDRESS="0x" + "2" * 40,
+            )
+
+    def test_legacy_wallet_addresses_remain_supported(self):
+        signer = "0x" + "1" * 40
+        funder = "0x" + "2" * 40
+        config = PolymarketConfig(
+            _env_file=None,
+            POLYGON_PRIVATE_KEY="1" * 64,
+            POLYGON_ADDRESS=signer,
+            POLYMARKET_FUNDER=funder,
+        )
+        assert config.effective_signer_address == signer
+        assert config.effective_funder == funder
+
+    def test_invalid_funder_address_is_rejected(self):
+        with pytest.raises(ValueError, match="POLYMARKET_FUNDER_ADDRESS"):
+            PolymarketConfig(
+                _env_file=None,
+                POLYGON_PRIVATE_KEY="1" * 64,
+                POLYMARKET_SIGNER_ADDRESS="0x" + "1" * 40,
+                POLYMARKET_FUNDER_ADDRESS="not-an-address",
+            )
+
+    def test_unsupported_signature_type_fails_closed(self):
+        with pytest.raises(ValueError, match="refusing to fall back"):
+            PolymarketClient(
+                private_key="1" * 64,
+                address="0x" + "1" * 40,
+                signature_type=99,
+            )
+
+    def test_autonomous_trading_is_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("ENABLE_AUTONOMOUS_TRADING", raising=False)
+        config = PolymarketConfig(_env_file=None, DEMO_MODE=True)
+        assert config.ENABLE_AUTONOMOUS_TRADING is False
 
 
 # ---------------------------------------------------------------------------

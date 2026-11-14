@@ -5,6 +5,8 @@ Loads and validates environment variables.
 
 import logging
 from typing import Optional
+
+from eth_account import Account
 from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -32,6 +34,10 @@ class PolymarketConfig(BaseSettings):
     # Required Polygon Wallet Configuration (optional in DEMO_MODE)
     POLYGON_PRIVATE_KEY: str = Field(
         default="", description="Polygon wallet private key (without 0x prefix)"
+    )
+    POLYMARKET_SIGNER_ADDRESS: Optional[str] = Field(
+        default=None,
+        description="Signer EOA address; takes precedence over the legacy POLYGON_ADDRESS",
     )
     POLYGON_ADDRESS: str = Field(default="", description="Polygon wallet address")
     POLYMARKET_CHAIN_ID: Optional[int] = Field(
@@ -69,13 +75,17 @@ class PolymarketConfig(BaseSettings):
         default=3,
         description=(
             "Wallet signature type for CLOB auth. Supported values: "
-            "0=EOA direct mode, 2=POLY_PROXY/proxy wallet, "
+            "0=EOA direct mode, 2=legacy Gnosis Safe contract-wallet mode, "
             "3=POLY_1271/deposit wallet (MetaMask deposit flow)."
         ),
     )
     POLYMARKET_FUNDER: Optional[str] = Field(
         default=None,
-        description="Funding wallet / deposit wallet address used by Polymarket UI and settlement",
+        description="Legacy alias for POLYMARKET_FUNDER_ADDRESS",
+    )
+    POLYMARKET_FUNDER_ADDRESS: Optional[str] = Field(
+        default=None,
+        description="Funding/deposit wallet address used by Polymarket UI and settlement",
     )
 
     # Safety Limits - Risk Management
@@ -97,7 +107,7 @@ class PolymarketConfig(BaseSettings):
 
     # Trading Controls
     ENABLE_AUTONOMOUS_TRADING: bool = Field(
-        default=True, description="Enable autonomous trading without confirmation"
+        default=False, description="Enable autonomous trading without confirmation"
     )
     REQUIRE_CONFIRMATION_ABOVE_USD: float = Field(
         default=500.0, description="Require user confirmation for orders above this USD amount"
@@ -189,33 +199,43 @@ class PolymarketConfig(BaseSettings):
             raise ValueError("POLYGON_PRIVATE_KEY must be valid hex")
         return v
 
+    @field_validator("POLYMARKET_SIGNER_ADDRESS", mode="before")
+    @classmethod
+    def normalize_signer_address(cls, v: Optional[str]) -> Optional[str]:
+        if v in (None, ""):
+            return None
+        return cls._normalize_wallet_address(v, "POLYMARKET_SIGNER_ADDRESS")
+
     @field_validator("POLYGON_ADDRESS")
     @classmethod
     def validate_address(cls, v: str, info) -> str:
-        """Validate Polygon address format (skipped in DEMO_MODE)"""
-        # Get DEMO_MODE from the data being validated
+        """Validate the legacy wallet field while allowing the new signer alias."""
         demo_mode = info.data.get("DEMO_MODE", False)
-
-        # In DEMO mode, wallet address is optional and never auto-filled
-        if demo_mode:
-            if not v:
-                return ""
-            if not v.startswith("0x"):
-                raise ValueError("POLYGON_ADDRESS must start with 0x")
-            if len(v) != 42:
-                raise ValueError("POLYGON_ADDRESS must be 42 characters")
-            return v.lower()
-
-        # Normal validation for non-demo mode
         if not v:
+            if demo_mode or info.data.get("POLYMARKET_SIGNER_ADDRESS"):
+                return ""
             raise ValueError(
-                "POLYGON_ADDRESS is required (or set DEMO_MODE=true for read-only access)"
+                "POLYMARKET_SIGNER_ADDRESS or POLYGON_ADDRESS is required "
+                "(or set DEMO_MODE=true for read-only access)"
             )
-        if not v.startswith("0x"):
-            raise ValueError("POLYGON_ADDRESS must start with 0x")
-        if len(v) != 42:
-            raise ValueError("POLYGON_ADDRESS must be 42 characters")
-        return v.lower()
+        return cls._normalize_wallet_address(v, "POLYGON_ADDRESS")
+
+    @field_validator("POLYMARKET_FUNDER_ADDRESS", "POLYMARKET_FUNDER", mode="before")
+    @classmethod
+    def normalize_funder_address(cls, v: Optional[str], info) -> Optional[str]:
+        if v in (None, ""):
+            return None
+        return cls._normalize_wallet_address(v, info.field_name)
+
+    @staticmethod
+    def _normalize_wallet_address(value: str, field_name: str) -> str:
+        if not isinstance(value, str) or not value.startswith("0x") or len(value) != 42:
+            raise ValueError(f"{field_name} must be a 42-character 0x-prefixed address")
+        try:
+            int(value[2:], 16)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must contain a valid hexadecimal address") from exc
+        return value.lower()
 
     @field_validator("MAX_SPREAD_TOLERANCE")
     @classmethod
@@ -309,7 +329,7 @@ class PolymarketConfig(BaseSettings):
         if v not in {0, 2, 3}:
             raise ValueError(
                 "POLYMARKET_SIGNATURE_TYPE must be 0 (EOA direct mode), "
-                "2 (POLY_PROXY/proxy wallet), or 3 (POLY_1271/deposit wallet)."
+                "2 (legacy contract-wallet mode), or 3 (POLY_1271/deposit wallet)."
             )
         return v
 
@@ -385,6 +405,19 @@ class PolymarketConfig(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def validate_explicit_signer_matches_private_key(self):
+        if not self.DEMO_MODE and self.POLYMARKET_SIGNER_ADDRESS:
+            try:
+                derived_address = Account.from_key(self.POLYGON_PRIVATE_KEY).address.lower()
+            except ValueError as exc:
+                raise ValueError("POLYGON_PRIVATE_KEY is not a valid EVM private key") from exc
+            if derived_address != self.POLYMARKET_SIGNER_ADDRESS:
+                raise ValueError(
+                    "POLYMARKET_SIGNER_ADDRESS does not match POLYGON_PRIVATE_KEY"
+                )
+        return self
+
+    @model_validator(mode="after")
     def validate_l2_bootstrap_requirements(self):
         """Validate L2 bootstrap requirements for non-demo runtime.
 
@@ -437,7 +470,16 @@ class PolymarketConfig(BaseSettings):
     @property
     def effective_funder(self) -> str:
         """Wallet address that actually funds positions/orders in Polymarket."""
-        return (self.POLYMARKET_FUNDER or self.POLYGON_ADDRESS).lower()
+        return (
+            self.POLYMARKET_FUNDER_ADDRESS
+            or self.POLYMARKET_FUNDER
+            or self.effective_signer_address
+        ).lower()
+
+    @property
+    def effective_signer_address(self) -> str:
+        """Resolve the signer address, preserving POLYGON_ADDRESS compatibility."""
+        return (self.POLYMARKET_SIGNER_ADDRESS or self.POLYGON_ADDRESS).lower()
 
     @property
     def effective_api_key(self) -> Optional[str]:
@@ -576,21 +618,29 @@ def validate_startup_config(config: "PolymarketConfig") -> None:
         )
 
     # --- Funder equals signer for non-EOA types ---
-    polygon_address = (getattr(config, "POLYGON_ADDRESS", None) or "").lower()
-    funder = (getattr(config, "POLYMARKET_FUNDER", None) or "").lower()
+    signer_address = (
+        getattr(config, "POLYMARKET_SIGNER_ADDRESS", None)
+        or getattr(config, "POLYGON_ADDRESS", None)
+        or ""
+    ).lower()
+    funder = (
+        getattr(config, "POLYMARKET_FUNDER_ADDRESS", None)
+        or getattr(config, "POLYMARKET_FUNDER", None)
+        or ""
+    ).lower()
     if (
-        polygon_address
+        signer_address
         and funder
-        and funder == polygon_address
+        and funder == signer_address
         and sig_type not in (None, 0)
     ):
         logger.warning(
-            "POLYMARKET_FUNDER (%s) equals POLYGON_ADDRESS — this is almost certainly a "
+            "Configured funder (%s) equals the signer address — this is almost certainly a "
             "misconfiguration for POLYMARKET_SIGNATURE_TYPE=%s. "
-            "For type 3 (POLY_1271/deposit wallet), POLYMARKET_FUNDER must be the deposit "
+            "For type 3 (POLY_1271/deposit wallet), the funder must be the deposit "
             "wallet address, which is different from your signer EOA. "
             "The server will attempt to discover the correct address automatically.",
-            polygon_address,
+            signer_address,
             sig_type,
         )
 

@@ -137,7 +137,7 @@ async def load_mcp_config():
             # Initialize client
             client = create_polymarket_client(
                 private_key=config.POLYGON_PRIVATE_KEY,
-                address=config.POLYGON_ADDRESS,
+                address=config.effective_signer_address,
                 chain_id=config.POLYMARKET_CHAIN_ID,
                 api_key=config.effective_api_key,
                 api_secret=config.effective_api_secret,
@@ -164,7 +164,7 @@ async def load_mcp_config():
         elif demo_mode:
             logger.info("Configuration loaded (DEMO_MODE=true, wallet not required)")
         else:
-            logger.info(f"Configuration loaded for address: {config.POLYGON_ADDRESS}")
+            logger.info("Configuration loaded for address: %s", config.effective_signer_address)
 
     except Exception as e:
         logger.error(f"Failed to load configuration: {e}")
@@ -191,7 +191,7 @@ async def dashboard_home(request: Request):
         "address": (
             "Not required (DEMO_MODE=true)"
             if (config and (getattr(config, "DEMO_MODE", False) is True))
-            else (config.POLYGON_ADDRESS if config else "Not configured")
+            else (config.effective_signer_address if config else "Not configured")
         ),
         "environment": config.POLYMARKET_ENV if config else "unknown",
         "chain_id": config.POLYMARKET_CHAIN_ID if config else None,
@@ -230,7 +230,7 @@ async def config_page(request: Request):
                 "auto_cancel_on_large_spread": config.AUTO_CANCEL_ON_LARGE_SPREAD,
             },
             "wallet": {
-                "address": config.POLYGON_ADDRESS,
+                "address": config.effective_signer_address,
                 "chain_id": config.POLYMARKET_CHAIN_ID,
             },
             "has_api_credentials": _has_authenticated_trading_access(),
@@ -298,7 +298,7 @@ async def get_status():
     return JSONResponse(
         {
             "connected": True,
-            "address": config.POLYGON_ADDRESS,
+            "address": config.effective_signer_address,
             "chain_id": config.POLYMARKET_CHAIN_ID,
             "has_api_credentials": _has_authenticated_trading_access(),
             "mode": "FULL" if _has_authenticated_trading_access() else "READ-ONLY",

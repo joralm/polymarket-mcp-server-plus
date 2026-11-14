@@ -7,6 +7,7 @@ Provides MCP server for Polymarket trading integration with Claude Desktop.
 import asyncio
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
@@ -74,6 +75,74 @@ def _has_authenticated_trading_access() -> bool:
     return bool(polymarket_client.has_api_credentials())
 
 
+def _configured_signer_address(settings: PolymarketConfig) -> str:
+    """Resolve the current signer setting while supporting older config doubles."""
+    signer = getattr(settings, "POLYMARKET_SIGNER_ADDRESS", None)
+    if isinstance(signer, str) and signer:
+        return signer
+    return settings.POLYGON_ADDRESS
+
+
+def _is_sensitive_argument(name: str) -> bool:
+    normalized = name.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "private_key",
+            "secret",
+            "passphrase",
+            "api_key",
+            "relayer_key",
+            "api_token",
+            "access_token",
+            "authorization",
+            "auth_token",
+        )
+    )
+
+
+def _redact_tool_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Preserve the error response shape without returning credential arguments."""
+    redacted: Dict[str, Any] = {}
+    for key, value in arguments.items():
+        if _is_sensitive_argument(key):
+            redacted[key] = "[REDACTED]"
+        elif isinstance(value, dict):
+            redacted[key] = _redact_tool_arguments(value)
+        elif isinstance(value, list):
+            redacted[key] = [
+                _redact_tool_arguments(item) if isinstance(item, dict) else item for item in value
+            ]
+        else:
+            redacted[key] = value
+    return redacted
+
+
+def _safe_tool_error(error: Exception, arguments: Dict[str, Any]) -> str:
+    """Keep useful error context while redacting configured and supplied secrets."""
+    message = str(error)
+    secrets: list[str] = []
+    if config:
+        for field in (
+            "POLYGON_PRIVATE_KEY",
+            "effective_api_key",
+            "effective_api_secret",
+            "effective_api_passphrase",
+        ):
+            value = getattr(config, field, None)
+            if isinstance(value, str) and value:
+                secrets.append(value)
+                if field == "POLYGON_PRIVATE_KEY":
+                    secrets.append(value[2:] if value.startswith("0x") else f"0x{value}")
+    for key, value in arguments.items():
+        if _is_sensitive_argument(key):
+            if isinstance(value, str):
+                secrets.append(value)
+    for secret in secrets:
+        message = re.sub(re.escape(secret), "[REDACTED]", message, flags=re.IGNORECASE)
+    return message
+
+
 def _log_docker_login_report() -> None:
     """Emit a startup report showing Docker auth inputs and effective trading readiness."""
     if not config:
@@ -99,7 +168,7 @@ def _log_docker_login_report() -> None:
         logger.info("  L2 auth bootstrap: Derived Wallet Credentials")
     else:
         logger.info("  L2 auth bootstrap: Missing Relayer Key")
-    logger.info("  signer (POLYGON_ADDRESS): %s", config.POLYGON_ADDRESS)
+    logger.info("  signer address: %s", _configured_signer_address(config))
     logger.info("  funder (POLYMARKET_FUNDER/effective): %s", config.effective_funder)
     logger.info("  signature_type: %s", config.POLYMARKET_SIGNATURE_TYPE)
     logger.info(
@@ -113,10 +182,11 @@ def _log_docker_login_report() -> None:
     logger.info("  FULL mode (trading enabled): %s", full_mode)
     if not full_mode:
         logger.info("  To enable FULL mode in Docker, ensure:")
-        logger.info("    1) POLYGON_PRIVATE_KEY matches POLYGON_ADDRESS")
-        logger.info("    2) POLYMARKET_FUNDER is the wallet that holds UI funds/positions")
+        logger.info("    1) POLYGON_PRIVATE_KEY matches the configured signer address")
+        logger.info("    2) POLYMARKET_FUNDER_ADDRESS is the wallet that holds UI funds/positions")
         logger.info(
-            "    3) POLYMARKET_SIGNATURE_TYPE is 0 (EOA direct), 2 (proxy wallet), or 3 (deposit wallet)"
+            "    3) POLYMARKET_SIGNATURE_TYPE is 0 (EOA direct), 2 (legacy Gnosis Safe), "
+            "or 3 (deposit wallet)"
         )
         logger.info(
             "    4) POLYMARKET_RELAYER_KEY is set and secret/passphrase are valid "
@@ -426,7 +496,7 @@ async def read_resource(uri: str) -> str:
         # Connection and authentication status
         status_data = {
             "connected": polymarket_client is not None,
-            "address": config.POLYGON_ADDRESS if config else None,
+            "address": _configured_signer_address(config) if config else None,
             "funder_address": config.effective_funder if config else None,
             "environment": config.POLYMARKET_ENV if config else "unknown",
             "network": _network_name_from_chain_id(config.POLYMARKET_CHAIN_ID if config else None),
@@ -592,8 +662,13 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
             raise ValueError(f"Unknown tool: {name}")
 
     except Exception as e:
-        logger.exception("Tool call failed: %s", name)
-        error_result = {"success": False, "error": str(e), "tool": name, "arguments": arguments}
+        logger.error("Tool call failed: %s (%s)", name, type(e).__name__)
+        error_result = {
+            "success": False,
+            "error": _safe_tool_error(e, arguments),
+            "tool": name,
+            "arguments": _redact_tool_arguments(arguments),
+        }
         return [types.TextContent(type="text", text=json.dumps(error_result, indent=2))]
 
 
@@ -655,7 +730,7 @@ async def initialize_server() -> None:
             logger.info("Configuration loaded (DEMO_MODE=true, walletless read-only mode)")
             polymarket_client = None
         else:
-            logger.info(f"Configuration loaded for address: {config.POLYGON_ADDRESS}")
+            logger.info("Configuration loaded for address: %s", _configured_signer_address(config))
             if config.effective_api_key:
                 logger.debug(
                     "POLYMARKET_API_KEY is %s",
@@ -668,7 +743,7 @@ async def initialize_server() -> None:
                 )
             logger.debug(
                 "Wallet auth config: signer=%s funder=%s signature_type=%s",
-                config.POLYGON_ADDRESS,
+                _configured_signer_address(config),
                 config.effective_funder,
                 config.POLYMARKET_SIGNATURE_TYPE,
             )
@@ -683,7 +758,7 @@ async def initialize_server() -> None:
             logger.info("Initializing Polymarket client...")
             polymarket_client = create_polymarket_client(
                 private_key=config.POLYGON_PRIVATE_KEY,
-                address=config.POLYGON_ADDRESS,
+                address=_configured_signer_address(config),
                 chain_id=config.POLYMARKET_CHAIN_ID,
                 api_key=config.effective_api_key,
                 api_secret=config.effective_api_secret,
